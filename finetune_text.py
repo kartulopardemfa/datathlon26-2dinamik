@@ -19,7 +19,9 @@ torch.set_num_threads(4)
 
 tr = pd.read_csv('data/train.csv', encoding='utf-8-sig')
 te = pd.read_csv('data/test.csv', encoding='utf-8-sig')
-y = tr['career_success_score'].values.astype(np.float32)
+y_raw = tr['career_success_score'].values.astype(np.float32)
+Y_MU, Y_SD = float(y_raw.mean()), float(y_raw.std())
+y = (y_raw - Y_MU) / Y_SD
 tok = AutoTokenizer.from_pretrained(MODEL)
 
 class DS(Dataset):
@@ -57,7 +59,10 @@ kf = KFold(5, shuffle=True, random_state=42)
 oof = np.zeros(len(tr)); tep = np.zeros(len(te))
 for fold, (tr_i, va_i) in enumerate(kf.split(texts_tr)):
     model = Reg()
-    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    opt = torch.optim.AdamW([
+        {'params': model.bb.parameters(), 'lr': LR},
+        {'params': model.head.parameters(), 'lr': 1e-3},
+    ])
     dl = DataLoader(DS(texts_tr[tr_i], y[tr_i]), batch_size=BS, shuffle=True)
     lossf = nn.MSELoss()
     model.train()
@@ -79,14 +84,15 @@ for fold, (tr_i, va_i) in enumerate(kf.split(texts_tr)):
     with torch.no_grad():
         va_dl = DataLoader(DS(texts_tr[va_i]), batch_size=64)
         preds = np.concatenate([model(b['input_ids'], b['attention_mask']).numpy() for b in va_dl])
+        preds = preds * Y_SD + Y_MU
         oof[va_i] = preds
         tp = np.concatenate([model(b['input_ids'], b['attention_mask']).numpy() for b in te_dl])
-        tep += tp / 5
-    print(f'fold {fold} val mse {mean_squared_error(y[va_i], preds):.2f}', flush=True)
+        tep += (tp * Y_SD + Y_MU) / 5
+    print(f'fold {fold} val mse {mean_squared_error(y_raw[va_i], preds):.2f}', flush=True)
     np.save(f'cache_ft_oof_f{fold}.npy', oof)
     np.save(f'cache_ft_te_f{fold}.npy', tep)
 
-print('FT text OOF MSE:', mean_squared_error(y, oof),
-      'corr:', np.corrcoef(oof, y)[0, 1], flush=True)
+print('FT text OOF MSE:', mean_squared_error(y_raw, oof),
+      'corr:', np.corrcoef(oof, y_raw)[0, 1], flush=True)
 np.save('cache_ft_oof.npy', oof)
 np.save('cache_ft_te.npy', tep)
