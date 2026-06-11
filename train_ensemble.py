@@ -6,7 +6,7 @@ Pipeline:
    - TF-IDF (word 1-3gram + char_wb 3-5gram) -> Ridge OOF prediction
    - Sentence-transformer embeddings -> Ridge OOF prediction
    - TF-IDF SVD components + embedding PCA components as direct features.
-3. LightGBM / XGBoost / CatBoost, 5-fold CV, 2 seeds each.
+3. LightGBM / XGBoost / CatBoost (5-fold CV, 2 seeds each) + MLP for diversity.
 4. OOF-optimized blend weights, predictions clipped to [0, 100].
 """
 import sys
@@ -57,8 +57,17 @@ for tr_i, va_i in folds:
     tfidf_te += r.predict(Ate) / N_FOLDS
 print('tfidf ridge MSE:', mean_squared_error(y, tfidf_oof))
 
-E_tr = np.load('cache_emb_tr.npy')
-E_te = np.load('cache_emb_te.npy')
+import os
+if os.path.exists('cache_emb_tr.npy'):
+    E_tr = np.load('cache_emb_tr.npy')
+    E_te = np.load('cache_emb_te.npy')
+else:
+    from sentence_transformers import SentenceTransformer
+    st = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    E_tr = st.encode(txt_tr.tolist(), batch_size=128)
+    E_te = st.encode(txt_te.tolist(), batch_size=128)
+    np.save('cache_emb_tr.npy', E_tr)
+    np.save('cache_emb_te.npy', E_te)
 emb_oof = np.zeros(len(tr)); emb_te = np.zeros(len(te))
 for tr_i, va_i in folds:
     r = Ridge(alpha=10.0)
@@ -138,12 +147,38 @@ def run_cat(seed):
         tep += m.predict(Xtc) / N_FOLDS
     return oof, tep
 
+def run_mlp(seed):
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.preprocessing import StandardScaler, OneHotEncoder
+    from sklearn.impute import SimpleImputer
+    num_tr = X.drop(columns=CAT_COLS)
+    num_te = Xte.drop(columns=CAT_COLS)
+    ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+    C_tr = ohe.fit_transform(X[CAT_COLS]); C_te = ohe.transform(Xte[CAT_COLS])
+    imp = SimpleImputer(strategy='median')
+    N_tr = imp.fit_transform(num_tr); N_te = imp.transform(num_te)
+    sc = StandardScaler()
+    Mtr = sc.fit_transform(np.hstack([N_tr, C_tr]))
+    Mte = sc.transform(np.hstack([N_te, C_te]))
+    oof = np.zeros(len(X)); tep = np.zeros(len(Xte))
+    for tr_i, va_i in folds:
+        m = MLPRegressor(hidden_layer_sizes=(256, 128), alpha=1e-3,
+                         learning_rate_init=1e-3, batch_size=256, max_iter=200,
+                         early_stopping=True, n_iter_no_change=15, random_state=seed)
+        m.fit(Mtr[tr_i], y[tr_i])
+        oof[va_i] = m.predict(Mtr[va_i])
+        tep += m.predict(Mte) / N_FOLDS
+    return oof, tep
+
 oofs, teps, names = [], [], []
 for seed in (42, 2026):
     for name, fn in (('lgb', run_lgb), ('xgb', run_xgb), ('cat', run_cat)):
         o, t = fn(seed)
         oofs.append(o); teps.append(t); names.append(f'{name}_{seed}')
         print(f'{name}_{seed} MSE: {mean_squared_error(y, np.clip(o, 0, 100)):.4f}')
+o, t = run_mlp(42)
+oofs.append(o); teps.append(t); names.append('mlp_42')
+print(f'mlp_42 MSE: {mean_squared_error(y, np.clip(o, 0, 100)):.4f}')
 
 O = np.vstack(oofs).T
 T = np.vstack(teps).T
@@ -154,9 +189,11 @@ def loss(w):
     return mean_squared_error(y, np.clip(O @ w, 0, 100))
 
 best = None
-for init in (np.ones(O.shape[1]), np.random.RandomState(0).rand(O.shape[1])):
+inits = [np.ones(O.shape[1])] + [np.random.RandomState(s).rand(O.shape[1]) + 0.5
+                                 for s in range(3)]
+for init in inits:
     res = minimize(loss, init, method='Nelder-Mead',
-                   options={'maxiter': 5000, 'xatol': 1e-6, 'fatol': 1e-8})
+                   options={'maxiter': 8000, 'xatol': 1e-6, 'fatol': 1e-9})
     if best is None or res.fun < best.fun:
         best = res
 w = np.abs(best.x); w = w / w.sum()
