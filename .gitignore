@@ -3,3 +3,4 @@ cache_*
 *.log
 nohup.out
 __pycache__/
+catboost_info/
