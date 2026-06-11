@@ -39,6 +39,8 @@ class Reg(nn.Module):
     def __init__(self):
         super().__init__()
         self.bb = AutoModel.from_pretrained(MODEL)
+        # freeze token embeddings (250k vocab dominates params; big CPU speedup)
+        self.bb.embeddings.word_embeddings.weight.requires_grad = False
         self.head = nn.Linear(self.bb.config.hidden_size, 1)
     def forward(self, input_ids, attention_mask, **kw):
         out = self.bb(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -61,13 +63,17 @@ for fold, (tr_i, va_i) in enumerate(kf.split(texts_tr)):
     model.train()
     for ep in range(EPOCHS):
         tot = 0
-        for b in dl:
+        import time; t0 = time.time()
+        for step, b in enumerate(dl):
             opt.zero_grad()
             p = model(b['input_ids'], b['attention_mask'])
             loss = lossf(p, b['target'])
             loss.backward()
             opt.step()
             tot += loss.item() * len(b['target'])
+            if step % 50 == 49:
+                print(f'fold {fold} ep {ep} step {step+1}/{len(dl)} '
+                      f'({(time.time()-t0)/(step+1):.2f}s/step)', flush=True)
         print(f'fold {fold} ep {ep} train mse {tot/len(tr_i):.2f}', flush=True)
     model.eval()
     with torch.no_grad():
@@ -77,6 +83,8 @@ for fold, (tr_i, va_i) in enumerate(kf.split(texts_tr)):
         tp = np.concatenate([model(b['input_ids'], b['attention_mask']).numpy() for b in te_dl])
         tep += tp / 5
     print(f'fold {fold} val mse {mean_squared_error(y[va_i], preds):.2f}', flush=True)
+    np.save(f'cache_ft_oof_f{fold}.npy', oof)
+    np.save(f'cache_ft_te_f{fold}.npy', tep)
 
 print('FT text OOF MSE:', mean_squared_error(y, oof),
       'corr:', np.corrcoef(oof, y)[0, 1], flush=True)
